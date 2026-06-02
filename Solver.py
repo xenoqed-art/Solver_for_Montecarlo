@@ -2,15 +2,26 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
-print("\n=== OPTIMIZADOR: ENTRADA DIRECTA POR TERMINAL ===")
+# ==========================================
+# CONFIGURACIÓN GLOBAL
+# ==========================================
+EPSILON = 0.01  # 1% para desigualdades estrictas (> 0)
+TOLERANCIA = 1e-9
+
+
+# ==========================================
+# MÓDULO 1: INGESTA Y LIMPIEZA
+# ==========================================
+def limpiar_numero(texto):
+    texto = texto.strip()
+    if texto.endswith("-"):
+        texto = "-" + texto[:-1]
+    return float(texto)
 
 
 def leer_bloque_texto(mensaje):
-    """Permite al usuario pegar un bloque de texto multilínea en la terminal."""
     print(mensaje)
-    print(
-        "  (Pega tus datos, presiona Enter, escribe la palabra FIN y presiona Enter de nuevo)"
-    )
+    print("  (Pega datos, presiona Enter, escribe FIN y presiona Enter)")
     lineas = []
     while True:
         linea = input()
@@ -22,198 +33,219 @@ def leer_bloque_texto(mensaje):
 
 
 # ==========================================
-# PASO 1: LEER RENDIMIENTOS (STATS)
+# MÓDULO 2: NÚCLEO MATEMÁTICO
 # ==========================================
-lineas_stats = leer_bloque_texto(
-    "\nPASO 1: Pega aquí las columnas de Nombres y Medias (sin encabezados):"
-)
+def min_riesgo(w, cov_matrix):
+    return (w.T @ cov_matrix @ w) * 1000000
 
-nombres = []
-retornos = []
 
-try:
-    for linea in lineas_stats:
-        partes = linea.split()
-        if len(partes) >= 2:
-            nombres.append(partes[0])
-            val_str = partes[-1].replace("%", "")
-            retornos.append(float(val_str) / 100.0)
+def max_rendimiento(w, retornos):
+    return -(w.T @ retornos) * 1000
 
-    retornos_array = np.array(retornos)
-    num_activos = len(nombres)
-    print(f"  [OK] {num_activos} activos leídos perfectamente: {nombres}")
-
-except Exception as e:
-    print(f"\n  [!] Hubo un error al procesar el texto: {e}")
-    exit()
 
 # ==========================================
-# PASO 2: LEER MATRIZ DE COVARIANZAS
+# MÓDULO 3: GESTOR DE REGLAS Y PUNTOS DE INICIO
 # ==========================================
-lineas_matriz = leer_bloque_texto(
-    "\nPASO 2: Pega aquí SOLO el bloque de números de tu matriz de covarianzas:"
-)
+def generar_punto_partida(num_activos, limites_tupla):
+    """Genera un x0 que respeta matemáticamente los límites fijos sin romper fronteras."""
+    w0 = np.zeros(num_activos)
+    capital_restante = 1.0
 
-filas_matriz = []
+    # 1. Clavar los límites mínimos y los iguales
+    for i in range(num_activos):
+        minimo = limites_tupla[i][0]
+        w0[i] = minimo
+        capital_restante -= minimo
 
-try:
-    for linea in lineas_matriz:
-        valores_fila = [float(v) for v in linea.split()]
-        filas_matriz.append(valores_fila)
+    # 2. Identificar qué activos tienen permitido recibir el capital sobrante
+    activos_flexibles = [
+        i
+        for i in range(num_activos)
+        if limites_tupla[i][1] - limites_tupla[i][0] > 1e-6
+    ]
 
-    cov_matrix = np.array(filas_matriz)
+    # 3. Repartir el sobrante
+    if capital_restante > 0 and activos_flexibles:
+        porcion = capital_restante / len(activos_flexibles)
+        for i in activos_flexibles:
+            w0[i] += porcion
 
-    if cov_matrix.shape != (num_activos, num_activos):
-        print(f"\n  [!] Error: Leí una matriz de {cov_matrix.shape}.")
-        print(f"      Debería ser cuadrada de {num_activos}x{num_activos}.")
-        exit()
+    # Omitimos divisiones extrañas para no corromper la memoria flotante de Python
+    return w0
 
-    print(f"  [OK] Matriz de {cov_matrix.shape} cargada exitosamente.")
 
-except Exception as e:
-    print(f"\n  [!] Hubo un error al procesar los números de la matriz: {e}")
-    exit()
+def solicitar_reglas(num_activos):
+    """Interfaz interactiva que traduce texto a tensores lógicos."""
+    limites = [[0.0, 1.0] for _ in range(num_activos)]
+    restricciones = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
-# ==========================================
-# PASO 2.5: RESTRICCIONES DINÁMICAS (CONJUNTOS)
-# ==========================================
-print("\n--- ÍNDICE DE ACTIVOS ---")
-# Te mostramos qué número le corresponde a cada activo para que puedas agruparlos
-for i, nombre in enumerate(nombres):
-    print(f"  [{i}] {nombre}")
-
-# Restricción obligatoria: La suma de todo el portafolio debe ser 100% (1.0)
-restricciones = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-
-print(
-    "\n¿Deseas agregar restricciones por conjuntos? (escribe 's' para sí, o presiona Enter para omitir)"
-)
-if input().strip().lower() == "s":
     while True:
-        print("\n--- NUEVA REGLA ---")
-        indices_str = input(
-            "  1. Ingresa los números de los activos a agrupar, separados por coma (ej. 0,1,2,3): "
-        )
-
-        try:
-            # Convertimos tu texto "0,1,2" en una lista matemática de Python [0, 1, 2]
-            indices_grupo = [int(x.strip()) for x in indices_str.split(",")]
-
-            tipo = (
-                input(
-                    "  2. ¿Es un límite MÁXIMO o MÍNIMO de inversión? (escribe 'max' o 'min'): "
-                )
-                .strip()
-                .lower()
-            )
-            limite_pct = (
-                float(input("  3. Ingresa el porcentaje límite (ej. 50 para 50%): "))
-                / 100.0
-            )
-
-            # EL TRUCO MATEMÁTICO:
-            # Scipy exige que la ecuación sea >= 0.
-            # Si es MAX: Limite - Suma >= 0
-            # Si es MIN: Suma - Limite >= 0
-            if tipo == "max":
-                restricciones.append(
-                    {
-                        "type": "ineq",
-                        "fun": lambda w, idx=indices_grupo, lim=limite_pct: lim
-                        - np.sum(w[idx]),
-                    }
-                )
-                print(
-                    f"  [OK] Regla añadida: Máximo {limite_pct*100}% para los activos {indices_grupo}"
-                )
-            elif tipo == "min":
-                restricciones.append(
-                    {
-                        "type": "ineq",
-                        "fun": lambda w, idx=indices_grupo, lim=limite_pct: np.sum(
-                            w[idx]
-                        )
-                        - lim,
-                    }
-                )
-                print(
-                    f"  [OK] Regla añadida: Mínimo {limite_pct*100}% para los activos {indices_grupo}"
-                )
-            else:
-                print("  [!] Tipo no reconocido. Escribe solo 'max' o 'min'.")
-
-        except Exception as e:
-            print(
-                "  [!] Error al ingresar los datos. Verifica que sean números válidos."
-            )
-
-        print(
-            "\n¿Quieres agregar otra regla de conjuntos? (escribe 's' para sí, o Enter para continuar al Solver)"
-        )
-        if input().strip().lower() != "s":
+        if input("\n¿Agregar reglas a este escenario? (s/n): ").strip().lower() != "s":
             break
 
-# Los límites individuales los dejamos de 0% a 100% (igual a Excel)
-limites = tuple((0.0, 1.0) for _ in range(num_activos))
+        try:
+            indices_str = input("  1. Activos (ej. 1,2,3 o 7): ")
+            idx_grupo = [int(x.strip()) for x in indices_str.split(",")]
+
+            if any(i < 0 or i >= num_activos for i in idx_grupo):
+                print(f"  [!] ERROR: Fuera de rango (0 a {num_activos - 1}).")
+                continue
+
+            tipo = input("  2. Condición ('<', '>', '='): ").strip()
+            limite_pct = float(input("  3. Porcentaje límite (ej. 0 o 10): ")) / 100.0
+            modo = (
+                input("  4. ¿Aplicar a SUMA o CADA UNO? (suma/cada): ").strip().lower()
+            )
+
+            if modo == "cada":
+                for i in idx_grupo:
+                    if tipo in ["<", "<="]:
+                        limites[i][1] = limite_pct
+                    elif tipo in [">", ">="]:
+                        limites[i][0] = EPSILON if limite_pct == 0.0 else limite_pct
+                    elif tipo == "=":
+                        limites[i][0] = limite_pct
+                        limites[i][1] = limite_pct
+                print(f"  [OK] LÍMITES ACTUALIZADOS (Individual)")
+
+            else:
+                if tipo in ["<", "<="]:
+                    restricciones.append(
+                        {
+                            "type": "ineq",
+                            "fun": lambda w, idx=idx_grupo, lim=limite_pct: lim
+                            - np.sum(w[idx]),
+                        }
+                    )
+                elif tipo in [">", ">="]:
+                    lim_real = EPSILON if limite_pct == 0.0 else limite_pct
+                    restricciones.append(
+                        {
+                            "type": "ineq",
+                            "fun": lambda w, idx=idx_grupo, lim=lim_real: np.sum(w[idx])
+                            - lim,
+                        }
+                    )
+                elif tipo == "=":
+                    restricciones.append(
+                        {
+                            "type": "eq",
+                            "fun": lambda w, idx=idx_grupo, lim=limite_pct: np.sum(
+                                w[idx]
+                            )
+                            - lim,
+                        }
+                    )
+                print(f"  [OK] RESTRICCIÓN AÑADIDA (Conjuntos)")
+
+        except Exception as e:
+            print("  [!] Entrada inválida. Intenta de nuevo.")
+
+    return tuple((l[0], l[1]) for l in limites), restricciones
+
 
 # ==========================================
-# PASO 3: OPTIMIZACIÓN (SOLVERS)
+# MÓDULO 4: EL SIMULADOR PRINCIPAL
 # ==========================================
-print("\nEjecutando algoritmos de optimización...")
+def iniciar_simulador():
+    print("\n=== INICIANDO SIMULADOR CUANTITATIVO MODULAR ===")
 
-restricciones = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    lineas_stats = leer_bloque_texto("\n[PASO 1] Pega Nombres y Medias:")
+    nombres, retornos = [], []
+    try:
+        for linea in lineas_stats:
+            partes = linea.split()
+            if len(partes) >= 2:
+                nombres.append(partes[0])
+                retornos.append(limpiar_numero(partes[-1].replace("%", "")) / 100.0)
+        retornos_array = np.array(retornos)
+        num_activos = len(nombres)
+        print(f"  [OK] {num_activos} activos cargados.")
+    except Exception as e:
+        print(f"  [!] Error: {e}")
+        return
 
-# El límite ajustado al cero absoluto, idéntico a Excel
-limites = tuple((0.0, 1.0) for _ in range(num_activos))
+    lineas_matriz = leer_bloque_texto("\n[PASO 2] Pega la Matriz de Covarianzas:")
+    filas_matriz = []
+    try:
+        for linea in lineas_matriz:
+            linea_limpia = (
+                linea.replace("E- ", "E-")
+                .replace("E+ ", "E+")
+                .replace("e- ", "e-")
+                .replace("e+ ", "e+")
+            )
+            filas_matriz.append([limpiar_numero(v) for v in linea_limpia.split()])
+        cov_matrix = np.array(filas_matriz)
+        if cov_matrix.shape != (num_activos, num_activos):
+            raise ValueError("Tamaño incorrecto.")
+        print(f"  [OK] Matriz cargada.")
+    except Exception as e:
+        print(f"  [!] Error en matriz: {e}")
+        return
 
-pesos_iniciales = np.ones(num_activos) / num_activos
+    numero_escenario = 1
+    while True:
+        print(f"\n" + "=" * 50)
+        print(f"   ESCENARIO #{numero_escenario}")
+        print("=" * 50)
+
+        print("\n--- ÍNDICE DE ACTIVOS ---")
+        for i, n in enumerate(nombres):
+            print(f"  [{i}] {n}")
+
+        limites_tupla, restricciones = solicitar_reglas(num_activos)
+
+        print("\n[AUDITORÍA DE LÍMITES MATEMÁTICOS]")
+        for i, n in enumerate(nombres):
+            print(
+                f"  {n}: Min {np.round(limites_tupla[i][0]*100, 2)}% | Max {np.round(limites_tupla[i][1]*100, 2)}%"
+            )
+
+        w0 = generar_punto_partida(num_activos, limites_tupla)
+
+        print("\nEjecutando optimización...")
+        res_min = minimize(
+            min_riesgo,
+            w0,
+            args=(cov_matrix,),
+            method="SLSQP",
+            bounds=limites_tupla,
+            constraints=restricciones,
+            tol=TOLERANCIA,
+        )
+        res_max = minimize(
+            max_rendimiento,
+            w0,
+            args=(retornos_array,),
+            method="SLSQP",
+            bounds=limites_tupla,
+            constraints=restricciones,
+            tol=TOLERANCIA,
+        )
+
+        df_resultados = pd.DataFrame(
+            {
+                "Activo": nombres,
+                "MinRisk (W)": np.round(res_min.x, 4),
+                "MaxProfit (W)": np.round(res_max.x, 4),
+            }
+        )
+
+        print(f"\n=== RESULTADOS: ESCENARIO #{numero_escenario} ===")
+        print(df_resultados.to_string(index=False))
+
+        try:
+            df_resultados.to_clipboard(index=False)
+            print("\n[ÉXITO] Copiado al portapapeles.")
+        except Exception:
+            pass
+
+        if input("\n¿Correr otro escenario? (s/n): ").strip().lower() != "s":
+            print("\nCerrando entorno.")
+            break
+        numero_escenario += 1
 
 
-# MODIFICACIÓN CLAVE: Escalar la varianza multiplicando por 1,000,000
-def min_riesgo(w):
-    return (np.dot(w.T, np.dot(cov_matrix, w))) * 1000000
-
-
-def max_rendimiento(w):
-    return -np.dot(w.T, retornos_array)
-
-
-# MODIFICACIÓN CLAVE: Añadir tol=1e-10 para mayor precisión
-res_min = minimize(
-    min_riesgo,
-    pesos_iniciales,
-    method="SLSQP",
-    bounds=limites,
-    constraints=restricciones,
-    tol=1e-10,
-)
-res_max = minimize(
-    max_rendimiento,
-    pesos_iniciales,
-    method="SLSQP",
-    bounds=limites,
-    constraints=restricciones,
-    tol=1e-10,
-)
-
-# ==========================================
-# PASO 4: RESULTADOS
-# ==========================================
-df_resultados = pd.DataFrame(
-    {
-        "Activo": nombres,
-        "MinRisk (W)": np.round(res_min.x, 4),
-        "MaxProfit (W)": np.round(res_max.x, 4),
-    }
-)
-
-print("\n=== RESULTADOS FINALES ===")
-print(df_resultados.to_string(index=False))
-
-try:
-    df_resultados.to_clipboard(index=False)
-    print(
-        "\n[ÉXITO] ¡Pesos óptimos copiados al portapapeles! Ve a Excel y presiona Ctrl+V."
-    )
-except Exception:
-    print("\n[!] Copia manualmente la tabla de arriba.")
+if __name__ == "__main__":
+    iniciar_simulador()
